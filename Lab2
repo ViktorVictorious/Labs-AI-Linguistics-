@@ -1,0 +1,635 @@
+!pip -q install gtts librosa soundfile pydub matplotlib tensorflow scikit-learn
+
+import os
+import random
+import shutil
+import pickle
+import numpy as np
+import librosa
+import librosa.display
+import soundfile as sf
+import matplotlib.pyplot as plt
+import tensorflow as tf
+
+from gtts import gTTS
+from pydub import AudioSegment
+from IPython.display import Audio, display
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+
+np.random.seed(42)
+random.seed(42)
+tf.random.set_seed(42)
+
+VOCAB = {
+    "A": "alpha",
+    "B": "bravo",
+    "C": "charlie",
+    "D": "delta",
+    "E": "echo",
+    "F": "foxtrot",
+    "G": "golf",
+    "H": "hotel",
+    "I": "india",
+    "J": "juliet",
+    "K": "kilo",
+    "L": "lima",
+    "M": "mike",
+    "N": "november",
+    "O": "oscar",
+    "P": "papa",
+    "Q": "quebec",
+    "R": "romeo",
+    "S": "sierra",
+    "T": "tango",
+    "U": "uniform",
+    "V": "victor",
+    "W": "whiskey",
+    "X": "xray",
+    "Y": "yankee",
+    "Z": "zulu",
+    "0": "zero",
+    "1": "one",
+    "2": "two",
+    "3": "three",
+    "4": "four",
+    "5": "five",
+    "6": "six",
+    "7": "seven",
+    "8": "eight",
+    "9": "nine"
+}
+
+REVERSE_VOCAB = {v: k for k, v in VOCAB.items()}
+TOKENS = list(VOCAB.values())
+
+DATASET_DIR = "aviation_dataset_cnn"
+SR = 16000
+N_MFCC = 40
+MAX_LEN = 80
+
+def clear_dir(path):
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    os.makedirs(path, exist_ok=True)
+
+def symbol_string_to_tokens(text):
+    tokens = []
+    for ch in text.strip().upper():
+        if ch == " ":
+            continue
+        if ch not in VOCAB:
+            raise ValueError(f"Недопустимий символ: {ch}. Дозволені лише A-Z та 0-9.")
+        tokens.append(VOCAB[ch])
+    return tokens
+
+def tokens_to_symbol_string(tokens):
+    return "".join(REVERSE_VOCAB.get(t, "?") for t in tokens)
+
+def tts_generate_token(token, out_mp3, lang="en", tld="com"):
+    gTTS(text=token, lang=lang, tld=tld).save(out_mp3)
+    return out_mp3
+
+def audio_to_wav(in_path, out_wav, sr=SR):
+    y, _ = librosa.load(in_path, sr=sr)
+    sf.write(out_wav, y, sr)
+    return out_wav
+
+def augment_signal(y, sr):
+    variants = []
+
+    variants.append(y.copy())
+
+    variants.append(y + 0.002 * np.random.randn(len(y)))
+    variants.append(y + 0.004 * np.random.randn(len(y)))
+
+    slow = librosa.effects.time_stretch(y, rate=0.94)
+    variants.append(slow)
+
+    fast = librosa.effects.time_stretch(y, rate=1.06)
+    variants.append(fast)
+
+    pitch_down = librosa.effects.pitch_shift(y, sr=sr, n_steps=-0.6)
+    variants.append(pitch_down)
+
+    pitch_up = librosa.effects.pitch_shift(y, sr=sr, n_steps=0.6)
+    variants.append(pitch_up)
+
+    shift = np.roll(y, np.random.randint(-300, 301))
+    variants.append(shift)
+
+    combo = librosa.effects.pitch_shift(y, sr=sr, n_steps=0.4)
+    combo = librosa.effects.time_stretch(combo, rate=1.03)
+    combo = combo + 0.002 * np.random.randn(len(combo))
+    variants.append(combo)
+
+    return variants
+
+def extract_mfcc_image(file_path, sr=SR, n_mfcc=N_MFCC, max_len=MAX_LEN):
+    y, sr = librosa.load(file_path, sr=sr)
+    y = librosa.util.normalize(y)
+
+    if len(y) < sr:
+        y = np.pad(y, (0, sr - len(y)))
+
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+    mfcc = (mfcc - np.mean(mfcc)) / (np.std(mfcc) + 1e-8)
+
+    if mfcc.shape[1] < max_len:
+        pad_width = max_len - mfcc.shape[1]
+        mfcc = np.pad(mfcc, ((0, 0), (0, pad_width)), mode="constant")
+    else:
+        mfcc = mfcc[:, :max_len]
+
+    return mfcc.astype(np.float32)
+
+def build_dataset(tokens, base_variants=("com", "co.uk", "com.au", "ca")):
+    clear_dir(DATASET_DIR)
+    paths = []
+    labels = []
+
+    for token in tokens:
+        token_dir = os.path.join(DATASET_DIR, token)
+        os.makedirs(token_dir, exist_ok=True)
+
+        base_paths = []
+
+        for i, tld in enumerate(base_variants):
+            mp3_path = os.path.join(token_dir, f"{token}_base_{i}.mp3")
+            wav_path = os.path.join(token_dir, f"{token}_base_{i}.wav")
+            tts_generate_token(token, mp3_path, tld=tld)
+            audio_to_wav(mp3_path, wav_path)
+            base_paths.append(wav_path)
+            paths.append(wav_path)
+            labels.append(token)
+
+        aug_id = 0
+        for wav_path in base_paths:
+            y, sr = librosa.load(wav_path, sr=SR)
+            augmented = augment_signal(y, sr)
+
+            for y_aug in augmented:
+                y_aug = librosa.util.normalize(y_aug)
+                aug_path = os.path.join(token_dir, f"{token}_aug_{aug_id}.wav")
+                sf.write(aug_path, y_aug, sr)
+                paths.append(aug_path)
+                labels.append(token)
+                aug_id += 1
+
+    return paths, labels
+
+def prepare_dataset(paths, labels):
+    X = np.array([extract_mfcc_image(p) for p in paths], dtype=np.float32)
+    X = X[..., np.newaxis]
+    y = np.array(labels)
+
+    encoder = LabelEncoder()
+    y_enc = encoder.fit_transform(y)
+    y_cat = tf.keras.utils.to_categorical(y_enc, num_classes=len(encoder.classes_))
+
+    return X, y, y_enc, y_cat, encoder
+
+def build_model(input_shape, num_classes):
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=input_shape),
+
+        tf.keras.layers.Conv2D(32, (3, 3), padding="same", activation="relu"),
+        tf.keras.layers.BatchNormalization(),
+        tf.keras.layers.MaxPooling2D((2, 2)),
+        tf.keras.layers.Dropout(0.20),
+
+        tf.keras.layers.Conv2D(64, (3, 3), padding="same", activation="relu"),
+        tf.keras.layers.BatchNormalization(),
+        tf.keras.layers.MaxPooling2D((2, 2)),
+        tf.keras.layers.Dropout(0.25),
+
+        tf.keras.layers.Conv2D(128, (3, 3), padding="same", activation="relu"),
+        tf.keras.layers.BatchNormalization(),
+        tf.keras.layers.MaxPooling2D((2, 2)),
+        tf.keras.layers.Dropout(0.30),
+
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dense(256, activation="relu"),
+        tf.keras.layers.Dropout(0.35),
+        tf.keras.layers.Dense(num_classes, activation="softmax")
+    ])
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss="categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+    return model
+
+def train_model(X, y_cat):
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y_cat,
+        test_size=0.25,
+        random_state=42,
+        stratify=np.argmax(y_cat, axis=1)
+    )
+
+    model = build_model(X.shape[1:], y_cat.shape[1])
+
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_accuracy",
+            patience=8,
+            restore_best_weights=True
+        )
+    ]
+
+    history = model.fit(
+        X_train,
+        y_train,
+        validation_data=(X_test, y_test),
+        epochs=40,
+        batch_size=32,
+        verbose=1,
+        callbacks=callbacks
+    )
+
+    test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
+    print("Test accuracy:", test_acc)
+
+    return model, history
+
+def recognize_token_audio(file_path, model, encoder, top_n=5):
+    feat = extract_mfcc_image(file_path)
+    feat = feat[np.newaxis, ..., np.newaxis]
+
+    probs = model.predict(feat, verbose=0)[0]
+    pred_idx = int(np.argmax(probs))
+    pred_token = encoder.inverse_transform([pred_idx])[0]
+
+    top_indices = np.argsort(probs)[::-1][:top_n]
+    top_tokens = encoder.inverse_transform(top_indices)
+    top_scores = probs[top_indices]
+
+    return pred_token, list(zip(top_tokens, top_scores))
+
+def synthesize_token_sequence(tokens, out_dir="sequence_audio", pause_ms=550, tld="com"):
+    clear_dir(out_dir)
+
+    part_paths = []
+    combined = AudioSegment.silent(duration=300)
+
+    for i, token in enumerate(tokens):
+        mp3_path = os.path.join(out_dir, f"{i:02d}_{token}.mp3")
+        wav_path = os.path.join(out_dir, f"{i:02d}_{token}.wav")
+        tts_generate_token(token, mp3_path, tld=tld)
+        audio_to_wav(mp3_path, wav_path)
+        part_paths.append(wav_path)
+
+        seg = AudioSegment.from_file(wav_path)
+        combined += seg + AudioSegment.silent(duration=pause_ms)
+
+    combined_path = os.path.join(out_dir, "combined_sequence.wav")
+    combined.export(combined_path, format="wav")
+    return part_paths, combined_path
+
+def recognize_token_sequence(part_paths, model, encoder):
+    recognized_tokens = []
+    details = []
+
+    for path in part_paths:
+        pred_token, top_scores = recognize_token_audio(path, model, encoder, top_n=5)
+        recognized_tokens.append(pred_token)
+        details.append(top_scores)
+
+    recognized_text = tokens_to_symbol_string(recognized_tokens)
+    return recognized_tokens, recognized_text, details
+
+def show_audio_and_plots(file_path, title):
+    print(title)
+    display(Audio(file_path))
+
+    y, sr = librosa.load(file_path, sr=SR)
+
+    plt.figure(figsize=(14, 4))
+    librosa.display.waveshow(y, sr=sr)
+    plt.title(title + " waveform")
+    plt.grid(True)
+    plt.show()
+
+    mfcc = extract_mfcc_image(file_path)
+    plt.figure(figsize=(12, 5))
+    librosa.display.specshow(mfcc, x_axis="time")
+    plt.title(title + " MFCC")
+    plt.colorbar()
+    plt.show()
+
+def plot_training_history(history):
+    plt.figure(figsize=(10, 4))
+    plt.plot(history.history["accuracy"], label="train_acc")
+    plt.plot(history.history["val_accuracy"], label="val_acc")
+    plt.title("Accuracy")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(history.history["loss"], label="train_loss")
+    plt.plot(history.history["val_loss"], label="val_loss")
+    plt.title("Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_token_scores(score_pairs, title):
+    labels = [x[0] for x in score_pairs]
+    values = [float(x[1]) for x in score_pairs]
+
+    plt.figure(figsize=(8, 3))
+    plt.bar(labels, values)
+    plt.ylim(0, 1)
+    plt.title(title)
+    plt.grid(True, axis="y")
+    plt.show()
+
+def compare_texts_visual(original_text, recognized_text):
+    original_chars = list(original_text)
+    recognized_chars = list(recognized_text)
+
+    n = max(len(original_chars), len(recognized_chars))
+    original_chars += [""] * (n - len(original_chars))
+    recognized_chars += [""] * (n - len(recognized_chars))
+    correct = [1 if original_chars[i] == recognized_chars[i] else 0 for i in range(n)]
+
+    plt.figure(figsize=(max(10, n), 3))
+    plt.bar(range(n), correct)
+    plt.ylim(0, 1.2)
+    plt.xticks(range(n), [f"{original_chars[i]}|{recognized_chars[i]}" for i in range(n)])
+    plt.title("Оригінал | розпізнано")
+    plt.grid(True, axis="y")
+    plt.show()
+
+def run_random_control_example(model, encoder, length=10):
+    random_symbols = random.choices(list(VOCAB.keys()), k=length)
+    original_text = "".join(random_symbols)
+    tokens = symbol_string_to_tokens(original_text)
+
+    part_paths, combined_path = synthesize_token_sequence(tokens, out_dir="random_control_audio", pause_ms=550, tld="com")
+    recognized_tokens, recognized_text, details = recognize_token_sequence(part_paths, model, encoder)
+
+    print("\nКОНТРОЛЬНИЙ ПРИКЛАД")
+    print("Початковий текст:", original_text)
+    print("Токени:", " ".join(tokens))
+    print("Розпізнані токени:", " ".join(recognized_tokens))
+    print("Повернений текст:", recognized_text)
+
+    show_audio_and_plots(combined_path, "Загальна аудіодоріжка")
+    compare_texts_visual(original_text, recognized_text)
+
+    for i in range(min(3, len(part_paths))):
+        print(f"\nТокен {i+1}: очікувано {tokens[i]}, розпізнано {recognized_tokens[i]}")
+        show_audio_and_plots(part_paths[i], f"Токен {i+1}")
+        plot_token_scores(details[i], f"Ймовірності для токена {i+1}")
+
+paths, labels = build_dataset(TOKENS)
+print("Кількість аудіофайлів:", len(paths))
+
+X, y, y_enc, y_cat, encoder = prepare_dataset(paths, labels)
+print("Форма X:", X.shape)
+print("Кількість класів:", len(encoder.classes_))
+
+model, history = train_model(X, y_cat)
+plot_training_history(history)
+
+model.save("aviation_cnn_model.keras")
+
+with open("aviation_encoder.pkl", "wb") as f:
+    pickle.dump(encoder, f)
+
+print("Модель збережено")
+print("Encoder збережено")
+
+run_random_control_example(model, encoder, length=10)
+
+
+
+
+import os
+import shutil
+import pickle
+import numpy as np
+import librosa
+import librosa.display
+import soundfile as sf
+import matplotlib.pyplot as plt
+import tensorflow as tf
+
+from gtts import gTTS
+from pydub import AudioSegment
+from IPython.display import Audio, display
+
+VOCAB = {
+    "A": "alpha",
+    "B": "bravo",
+    "C": "charlie",
+    "D": "delta",
+    "E": "echo",
+    "F": "foxtrot",
+    "G": "golf",
+    "H": "hotel",
+    "I": "india",
+    "J": "juliet",
+    "K": "kilo",
+    "L": "lima",
+    "M": "mike",
+    "N": "november",
+    "O": "oscar",
+    "P": "papa",
+    "Q": "quebec",
+    "R": "romeo",
+    "S": "sierra",
+    "T": "tango",
+    "U": "uniform",
+    "V": "victor",
+    "W": "whiskey",
+    "X": "xray",
+    "Y": "yankee",
+    "Z": "zulu",
+    "0": "zero",
+    "1": "one",
+    "2": "two",
+    "3": "three",
+    "4": "four",
+    "5": "five",
+    "6": "six",
+    "7": "seven",
+    "8": "eight",
+    "9": "nine"
+}
+
+REVERSE_VOCAB = {v: k for k, v in VOCAB.items()}
+SR = 16000
+N_MFCC = 40
+MAX_LEN = 80
+
+def clear_dir(path):
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    os.makedirs(path, exist_ok=True)
+
+def symbol_string_to_tokens(text):
+    tokens = []
+    for ch in text.strip().upper():
+        if ch == " ":
+            continue
+        if ch not in VOCAB:
+            raise ValueError(f"Недопустимий символ: {ch}. Дозволені лише A-Z та 0-9.")
+        tokens.append(VOCAB[ch])
+    return tokens
+
+def tokens_to_symbol_string(tokens):
+    return "".join(REVERSE_VOCAB.get(t, "?") for t in tokens)
+
+def tts_generate_token(token, out_mp3, lang="en", tld="com"):
+    gTTS(text=token, lang=lang, tld=tld).save(out_mp3)
+    return out_mp3
+
+def audio_to_wav(in_path, out_wav, sr=SR):
+    y, _ = librosa.load(in_path, sr=sr)
+    sf.write(out_wav, y, sr)
+    return out_wav
+
+def extract_mfcc_image(file_path, sr=SR, n_mfcc=N_MFCC, max_len=MAX_LEN):
+    y, sr = librosa.load(file_path, sr=sr)
+    y = librosa.util.normalize(y)
+
+    if len(y) < sr:
+        y = np.pad(y, (0, sr - len(y)))
+
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+    mfcc = (mfcc - np.mean(mfcc)) / (np.std(mfcc) + 1e-8)
+
+    if mfcc.shape[1] < max_len:
+        pad_width = max_len - mfcc.shape[1]
+        mfcc = np.pad(mfcc, ((0, 0), (0, pad_width)), mode="constant")
+    else:
+        mfcc = mfcc[:, :max_len]
+
+    return mfcc.astype(np.float32)
+
+def recognize_token_audio(file_path, model, encoder, top_n=5):
+    feat = extract_mfcc_image(file_path)
+    feat = feat[np.newaxis, ..., np.newaxis]
+
+    probs = model.predict(feat, verbose=0)[0]
+    pred_idx = int(np.argmax(probs))
+    pred_token = encoder.inverse_transform([pred_idx])[0]
+
+    top_indices = np.argsort(probs)[::-1][:top_n]
+    top_tokens = encoder.inverse_transform(top_indices)
+    top_scores = probs[top_indices]
+
+    return pred_token, list(zip(top_tokens, top_scores))
+
+def synthesize_token_sequence(tokens, out_dir="interactive_audio", pause_ms=550, tld="com"):
+    clear_dir(out_dir)
+
+    part_paths = []
+    combined = AudioSegment.silent(duration=300)
+
+    for i, token in enumerate(tokens):
+        mp3_path = os.path.join(out_dir, f"{i:02d}_{token}.mp3")
+        wav_path = os.path.join(out_dir, f"{i:02d}_{token}.wav")
+        tts_generate_token(token, mp3_path, tld=tld)
+        audio_to_wav(mp3_path, wav_path)
+        part_paths.append(wav_path)
+
+        seg = AudioSegment.from_file(wav_path)
+        combined += seg + AudioSegment.silent(duration=pause_ms)
+
+    combined_path = os.path.join(out_dir, "combined_sequence.wav")
+    combined.export(combined_path, format="wav")
+    return part_paths, combined_path
+
+def recognize_token_sequence(part_paths, model, encoder):
+    recognized_tokens = []
+    details = []
+
+    for path in part_paths:
+        pred_token, top_scores = recognize_token_audio(path, model, encoder, top_n=5)
+        recognized_tokens.append(pred_token)
+        details.append(top_scores)
+
+    recognized_text = tokens_to_symbol_string(recognized_tokens)
+    return recognized_tokens, recognized_text, details
+
+def show_audio_and_plots(file_path, title):
+    print(title)
+    display(Audio(file_path))
+
+    y, sr = librosa.load(file_path, sr=SR)
+
+    plt.figure(figsize=(14, 4))
+    librosa.display.waveshow(y, sr=sr)
+    plt.title(title + " waveform")
+    plt.grid(True)
+    plt.show()
+
+    mfcc = extract_mfcc_image(file_path)
+    plt.figure(figsize=(12, 5))
+    librosa.display.specshow(mfcc, x_axis="time")
+    plt.title(title + " MFCC")
+    plt.colorbar()
+    plt.show()
+
+def plot_token_scores(score_pairs, title):
+    labels = [x[0] for x in score_pairs]
+    values = [float(x[1]) for x in score_pairs]
+
+    plt.figure(figsize=(8, 3))
+    plt.bar(labels, values)
+    plt.ylim(0, 1)
+    plt.title(title)
+    plt.grid(True, axis="y")
+    plt.show()
+
+def compare_texts_visual(original_text, recognized_text):
+    original_chars = list(original_text)
+    recognized_chars = list(recognized_text)
+
+    n = max(len(original_chars), len(recognized_chars))
+    original_chars += [""] * (n - len(original_chars))
+    recognized_chars += [""] * (n - len(recognized_chars))
+    correct = [1 if original_chars[i] == recognized_chars[i] else 0 for i in range(n)]
+
+    plt.figure(figsize=(max(10, n), 3))
+    plt.bar(range(n), correct)
+    plt.ylim(0, 1.2)
+    plt.xticks(range(n), [f"{original_chars[i]}|{recognized_chars[i]}" for i in range(n)])
+    plt.title("Оригінал | розпізнано")
+    plt.grid(True, axis="y")
+    plt.show()
+
+model = tf.keras.models.load_model("aviation_cnn_model.keras")
+
+with open("aviation_encoder.pkl", "rb") as f:
+    encoder = pickle.load(f)
+
+def interactive_demo(model, encoder):
+    user_text = input("Введи рядок з A-Z та 0-9: ").strip().upper()
+    tokens = symbol_string_to_tokens(user_text)
+
+    part_paths, combined_path = synthesize_token_sequence(tokens, out_dir="interactive_audio", pause_ms=550, tld="com")
+    recognized_tokens, recognized_text, details = recognize_token_sequence(part_paths, model, encoder)
+
+    print("\nІНТЕРАКТИВНИЙ ПРИКЛАД")
+    print("Текст:", user_text)
+    print("Вхід ", " ".join(tokens))
+    print("Вихід", " ".join(recognized_tokens))
+    print("Повернений текст:", recognized_text)
+
+    show_audio_and_plots(combined_path, "Аудіодоріжка для введеного тексту")
+    compare_texts_visual(user_text, recognized_text)
+
+    for i in range(min(3, len(part_paths))):
+        print(f"\nТокен {i+1}: очікувано {tokens[i]}, розпізнано {recognized_tokens[i]}")
+        show_audio_and_plots(part_paths[i], f"Токен {i+1}")
+        plot_token_scores(details[i], f"Ймовірності для токена {i+1}")
+
+interactive_demo(model, encoder)
