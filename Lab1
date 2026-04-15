@@ -1,0 +1,176 @@
+!wget -q https://info-ee.surrey.ac.uk/CVSSP/demos/chars74k/EnglishHnd.tgz
+!tar -xzf EnglishHnd.tgz
+
+import os
+import glob
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image, ImageOps
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix
+import tensorflow as tf
+from tensorflow.keras import layers
+
+np.random.seed(42)
+tf.random.set_seed(42)
+random.seed(42)
+
+label_map = list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+sample_to_char = {}
+for i in range(1, 11):
+    sample_to_char[f"Sample{i:03d}"] = str(i - 1)
+for i in range(11, 37):
+    sample_to_char[f"Sample{i:03d}"] = chr(ord("A") + i - 11)
+
+base_dir = "/content/English/Hnd/Img"
+all_files = []
+
+for sample_name in sample_to_char:
+    pattern = os.path.join(base_dir, sample_name, "*.png")
+    all_files.extend(glob.glob(pattern))
+
+print("Found images:", len(all_files))
+
+def load_image(path):
+    img = Image.open(path).convert("L")
+    img = ImageOps.invert(img)
+    img = img.resize((28, 28))
+    arr = np.array(img, dtype=np.float32) / 255.0
+    arr = np.expand_dims(arr, axis=-1)
+    return arr
+
+X = []
+y = []
+
+for path in all_files:
+    sample_name = os.path.basename(os.path.dirname(path))
+    char_label = sample_to_char[sample_name]
+    label_id = label_map.index(char_label)
+    X.append(load_image(path))
+    y.append(label_id)
+
+X = np.array(X, dtype=np.float32)
+y = np.array(y, dtype=np.int32)
+
+print("X shape:", X.shape)
+print("y shape:", y.shape)
+print("Classes:", len(label_map))
+
+x_train, x_temp, y_train, y_temp = train_test_split(
+    X, y, test_size=0.30, random_state=42, stratify=y
+)
+
+x_val, x_test, y_val, y_test = train_test_split(
+    x_temp, y_temp, test_size=0.50, random_state=42, stratify=y_temp
+)
+
+print("Train:", x_train.shape, y_train.shape)
+print("Val:", x_val.shape, y_val.shape)
+print("Test:", x_test.shape, y_test.shape)
+
+model = tf.keras.Sequential([
+    layers.Input(shape=(28, 28, 1)),
+    layers.Conv2D(32, 3, activation="relu"),
+    layers.MaxPooling2D(),
+    layers.Conv2D(64, 3, activation="relu"),
+    layers.MaxPooling2D(),
+    layers.Flatten(),
+    layers.Dense(128, activation="relu"),
+    layers.Dropout(0.3),
+    layers.Dense(len(label_map), activation="softmax")
+])
+
+model.compile(
+    optimizer="adam",
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+early_stop = tf.keras.callbacks.EarlyStopping(
+    monitor="val_accuracy",
+    patience=3,
+    restore_best_weights=True
+)
+
+history = model.fit(
+    x_train, y_train,
+    epochs=15,
+    batch_size=64,
+    validation_data=(x_val, y_val),
+    callbacks=[early_stop],
+    verbose=1
+)
+
+val_loss, val_acc = model.evaluate(x_val, y_val, verbose=0)
+test_loss, test_acc = model.evaluate(x_test, y_test, verbose=0)
+
+print(f"Val accuracy: {val_acc:.4f}")
+print(f"Test accuracy: {test_acc:.4f}")
+
+y_pred_prob = model.predict(x_test, verbose=0)
+y_pred = np.argmax(y_pred_prob, axis=1)
+
+cm = confusion_matrix(y_test, y_pred)
+
+plt.figure(figsize=(10, 8))
+plt.imshow(cm)
+plt.title("Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.colorbar()
+plt.show()
+
+idx = np.random.choice(len(x_test), 30, replace=False)
+
+plt.figure(figsize=(15, 10))
+for i, j in enumerate(idx):
+    plt.subplot(5, 6, i + 1)
+    plt.imshow(x_test[j].squeeze(), cmap="gray")
+    true_label = label_map[y_test[j]]
+    pred_label = label_map[y_pred[j]]
+    plt.title(f"T:{true_label} P:{pred_label}")
+    plt.axis("off")
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+
+from google.colab import files
+from PIL import Image, ImageOps
+import numpy as np
+import matplotlib.pyplot as plt
+
+label_map = list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+def preprocess_image(path):
+    img = Image.open(path).convert("L")
+    img = ImageOps.invert(img)
+
+    img = img.resize((28, 28))
+    arr = np.array(img, dtype=np.float32) / 255.0
+    arr = arr.reshape(1, 28, 28, 1)
+
+    return arr
+
+uploaded = files.upload()
+
+for filename in uploaded.keys():
+    x = preprocess_image(filename)
+
+    pred = model.predict(x, verbose=0)
+    pred_class = int(np.argmax(pred))
+    pred_symbol = label_map[pred_class]
+
+    plt.imshow(x[0, :, :, 0], cmap="gray")
+    plt.title(f"Predicted: {pred_symbol}")
+    plt.axis("off")
+    plt.show()
+
+    print("Predicted class:", pred_class)
+    print("Predicted symbol:", pred_symbol)
+    print("Confidence:", float(pred[0][pred_class]))
